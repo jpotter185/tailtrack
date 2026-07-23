@@ -1,6 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
-import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
-
 // Raw shape returned by the airplanes.live API, field names as-is.
 interface RawAircraft {
   hex: string;
@@ -129,7 +126,6 @@ const ROUTE_INFO_FIELDS: (keyof RouteInfo)[] = [
 const MILES_PER_NM = 1.150779448;
 
 interface HttpRequest {
-  headers?: Record<string, string | undefined>;
   queryStringParameters?: Record<string, string | undefined>;
 }
 
@@ -147,52 +143,7 @@ function jsonResponse(statusCode: number, body: unknown): HttpResponse {
   };
 }
 
-const ssmClient = new SSMClient({});
-let cachedApiKey: Promise<string> | undefined;
-
-// Fetched once per Lambda execution environment and reused across
-// invocations in that container, rather than hitting SSM on every request.
-function getExpectedApiKey(): Promise<string> {
-  if (!cachedApiKey) {
-    const parameterName = process.env.API_KEY_PARAMETER_NAME;
-    if (!parameterName) {
-      return Promise.reject(
-        new Error("API_KEY_PARAMETER_NAME environment variable is not set"),
-      );
-    }
-    cachedApiKey = ssmClient
-      .send(new GetParameterCommand({ Name: parameterName, WithDecryption: true }))
-      .then((result) => {
-        const value = result.Parameter?.Value;
-        if (!value) throw new Error(`SSM parameter ${parameterName} has no value`);
-        return value;
-      })
-      .catch((err) => {
-        cachedApiKey = undefined; // don't poison the container on a transient failure
-        throw err;
-      });
-  }
-  return cachedApiKey;
-}
-
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
-}
-
 export async function handler(event: HttpRequest): Promise<HttpResponse> {
-  try {
-    const expectedApiKey = await getExpectedApiKey();
-    const providedApiKey = event.headers?.["x-api-key"];
-    if (!providedApiKey || !safeEqual(providedApiKey, expectedApiKey)) {
-      return jsonResponse(401, { error: "Missing or invalid x-api-key header" });
-    }
-  } catch (err) {
-    console.error(`API key check failed: ${(err as Error).message}`);
-    return jsonResponse(500, { error: "Internal error" });
-  }
-
   const params = event.queryStringParameters ?? {};
 
   const lat = Number(params.lat);

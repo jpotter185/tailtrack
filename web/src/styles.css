@@ -1,0 +1,161 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f5f6f8;
+  color: #1a1a1a;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.75rem;
+}
+
+header p {
+  margin: 0.25rem 0 1.5rem;
+  color: #666;
+}
+
+.search-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.search-form input[type="text"] {
+  flex: 1;
+  min-width: 200px;
+}
+
+.search-form input,
+.search-form select,
+.search-form button {
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+  font-size: 0.95rem;
+}
+
+.search-form input[type="number"] {
+  width: 80px;
+}
+
+.search-form button {
+  background: #1a73e8;
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+.search-form button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.error {
+  color: #c0392b;
+  width: 100%;
+}
+
+.results {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 800px) {
+  .results {
+    grid-template-columns: 1fr;
+  }
+}
+
+.map {
+  height: 500px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.flight-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.flight-card {
+  background: white;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+
+.flight-card.selected {
+  border-color: #1a73e8;
+}
+
+.flight-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+}
+
+.flight-card-header a {
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: #1a73e8;
+  text-decoration: none;
+}
+
+.aircraft-type {
+  margin: 0.25rem 0;
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.route {
+  margin: 0.25rem 0;
+  font-size: 0.9rem;
+}
+
+.flight-stats {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: #444;
+  margin-top: 0.5rem;
+}
+
+.empty {
+  color: #666;
+}
+
+.plane-icon div {
+  font-size: 20px;
+  text-align: center;
+  line-height: 24px;
+}
+
+.plane-icon.selected div {
+  font-size: 26px;
+  color: #1a73e8;
+}
+
+.search-center-icon {
+  font-size: 20px;
+  text-align: center;
+}

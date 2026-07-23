@@ -5,10 +5,10 @@
     "build": "tsc",
     "watch": "tsc -w",
     "test": "jest --passWithNoTests",
-    "cdk": "cdk"
+    "cdk": "cdk",
+    "deploy": "npm --prefix web run build && cdk deploy"
   },
   "devDependencies": {
-    "@aws-sdk/client-ssm": "^3.1093.0",
     "@swc/core": "^1.15.0",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30",

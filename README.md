@@ -1,73 +1,113 @@
 # tailtrack
 
-Looks up aircraft flying over a location right now. Give it a lat, lon, and radius (nm), and
-it queries [airplanes.live](https://airplanes.live) for aircraft in range, filters out
-anything still on the ground, and enriches each result with airline/route info looked up from
+Looks up aircraft flying over a location right now, and shows them in a web app: enter a
+location (typed, or your current location) and a radius, and see the aircraft currently in
+range on a live map plus detail cards. Under the hood it queries
+[airplanes.live](https://airplanes.live) for aircraft in range, filters out anything still on
+the ground, and enriches each result with airline/route info looked up from
 [adsbdb.com](https://api.adsbdb.com) by callsign.
 
 ## How it works
 
-- **`GetFlights`** (Lambda) — the only resource in the stack. Exposed via a Lambda Function
-  URL, gated by a required `x-api-key` header (see [API key](#api-key) below). Accepts `lat`,
-  `lon`, and either `radiusNm` or `radiusMiles` as query string params, and returns the
-  current aircraft in range, each with its raw position/altitude/speed fields (renamed to
+- **`GetFlights`** (Lambda) — looks up aircraft for a `lat`/`lon`/radius (`radiusNm` or
+  `radiusMiles`), returning each aircraft's position/altitude/speed fields (renamed to
   human-readable names), any route info found for its callsign, and a `flightRadarUrl`
   linking to that flight on FlightRadar24 (omitted for aircraft with no callsign — mostly
-  private/GA flights).
+  private/GA flights). Exposed via a Lambda Function URL, but that URL is **not** meant to be
+  called directly — see [Access control](#access-control) below.
+- **`web/`** — the Vite + React frontend. See `web/README.md` for local dev.
+- Both are served from one CloudFront distribution: `/` (and other static paths) → the built
+  frontend in a private S3 bucket, `/api/*` → the `GetFlights` Function URL. Since the UI and
+  API share an origin, the frontend just calls `/api/flights?...` with no CORS setup needed.
 
 Known limitation: route/airline data comes from a callsign→schedule lookup, not a live flight
 plan, so it can be wrong for delayed flights or reused flight numbers.
+
+## Access control
+
+The Function URL's auth type is `AWS_IAM`, and the CloudFront distribution's `/api/*` origin
+uses Origin Access Control (OAC) — CloudFront signs requests to the Lambda on its own behalf,
+and the Lambda's resource policy only grants invoke permission to *that specific
+distribution*. Anyone can use the deployed site (there's no login/API key), but nobody can
+call the Lambda directly, bypassing CloudFront and the UI. This is all wired up by CDK
+(`origins.FunctionUrlOrigin.withOriginAccessControl(...)`) — no manual IAM policy to write or
+secret to manage.
+
+(An earlier iteration of this project required an `x-api-key` header checked against an SSM
+parameter. That's gone now that OAC handles access control at the AWS level. If you created
+`/tailtrack/api-key` in SSM before, it's unused and safe to delete: `aws ssm delete-parameter
+--name /tailtrack/api-key`.)
+
+## Custom domain
+
+The site is served at `tailtrack.tallyo.us` (hardcoded as `DOMAIN_NAME` in
+`lib/tailtrack-stack.ts`) instead of the raw `*.cloudfront.net` domain. This needs two things
+CDK can't do on its own, since tallyo.us's DNS isn't hosted on Route 53:
+
+1. **An ACM certificate in `us-east-1`** — CloudFront only accepts certs from that region,
+   regardless of which region the rest of this stack deploys to. One-time setup:
+
+   ```bash
+   aws acm request-certificate \
+     --domain-name tailtrack.tallyo.us \
+     --validation-method DNS \
+     --region us-east-1
+   ```
+
+   Then fetch the validation record you need to add at your DNS provider:
+
+   ```bash
+   aws acm describe-certificate --region us-east-1 --certificate-arn <ARN from above> \
+     --query "Certificate.DomainValidationOptions[0].ResourceRecord"
+   ```
+
+   Add that as a CNAME record with your DNS provider (Namecheap/Cloudflare/etc.) and leave it
+   in place permanently — ACM reuses it for automatic renewal, not just initial issuance.
+   Validation can take anywhere from a few minutes to a few hours after the record propagates.
+
+2. **`CERTIFICATE_ARN`** set in your shell before deploying — `bin/tailtrack.ts` reads it and
+   fails fast with a clear error if it's missing:
+
+   ```bash
+   export CERTIFICATE_ARN=<ARN from step 1, once ISSUED>
+   ```
+
+3. **After deploying**, point `tailtrack.tallyo.us` at CloudFront with one more manual DNS
+   record — a CNAME to the `CloudFrontDomainName` stack output (see
+   [Deploying](#deploying)).
 
 ## Prerequisites
 
 - Node.js and npm
 - AWS credentials configured (`aws sts get-caller-identity` should succeed)
 - The target AWS account/region bootstrapped for CDK (`npx cdk bootstrap`, one-time)
+- `CERTIFICATE_ARN` set (see [Custom domain](#custom-domain) — required, `cdk synth`/`deploy`
+  will fail without it)
 
 ## Useful commands
 
-* `npm run build`     type-check the project
+* `npm run build`     type-check the CDK app
 * `npm run watch`     watch for changes and type-check
 * `npm run test`      run the jest unit tests
 * `npx cdk synth`     emit the synthesized CloudFormation template
 * `npx cdk diff`      compare deployed stack with current state
-* `npx cdk deploy`    deploy this stack to your configured AWS account/region
+* `npm run deploy`    build the web app, then `cdk deploy` (does both steps in order)
+* `npx cdk deploy`    deploy without rebuilding the web app (only if `web/dist` is already
+  current)
 
-## API key
+## Deploying
 
-The Function URL has no AWS-native auth (Function URLs don't support API Gateway-style API
-keys) — instead, the handler checks an `x-api-key` header against a value stored in SSM
-Parameter Store as a `SecureString`. There's no CRUD API for it, same as other one-off config
-in this project — create it directly:
-
-```bash
-aws ssm put-parameter \
-  --name "/tailtrack/api-key" \
-  --type SecureString \
-  --value "$(openssl rand -hex 32)"
-```
-
-Save the generated value somewhere — SSM won't show it back to you except via `get-parameter
---with-decryption`. To rotate it, `put-parameter ... --overwrite` with a new value; the
-Lambda caches the key per execution environment, so it can take up to the container's
-lifetime to pick up a rotated value (cold starts always fetch fresh).
-
-## Invoking it
-
-Plain `GET` request to the function URL with the API key in a header. `lat` and `lon` are
-required; radius accepts either `radiusNm` or `radiusMiles` (exactly one is required):
+The web app has to be built *before* `cdk deploy`, since the stack's `BucketDeployment`
+uploads whatever's in `web/dist`:
 
 ```bash
-curl -H "x-api-key: <your key>" \
-  "<GetFlights function URL, from stack outputs>?lat=40.6413&lon=-73.7781&radiusNm=50"
+npm --prefix web install   # first time only
+npm run deploy              # builds web/, then cdk deploy
 ```
 
-Stack output names (function URL, function name) are printed after `cdk deploy`, or fetch
-them any time with:
+Stack outputs (including `SiteUrl`, the CloudFront URL to open in a browser) are printed
+after `cdk deploy`, or fetch them any time with:
 
 ```bash
 aws cloudformation describe-stacks --stack-name TailtrackStack --query "Stacks[0].Outputs"
 ```
-
-curl -H "x-api-key: <your key>" \
-  "https://we6763sajfixltezw7cwjw74ge0bylmy.lambda-url.us-east-2.on.aws/?lat=40.6413&lon=-73.7781&radiusNm=50"
