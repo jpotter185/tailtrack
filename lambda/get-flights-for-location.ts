@@ -1,12 +1,5 @@
-import { DynamoDBClient, ScanCommand, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
-import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
-
-interface Subscription {
-  subscriptionId: string;
-  lat: number;
-  lon: number;
-  radiusNm: number;
-}
+import { timingSafeEqual } from "node:crypto";
+import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 
 // Raw shape returned by the airplanes.live API, field names as-is.
 interface RawAircraft {
@@ -113,128 +106,199 @@ interface RouteInfo {
   destinationAirportMunicipality?: string;
 }
 
-const ROUTE_INFO_FIELDS: (keyof RouteInfo)[] = [
-  'airlineName',
-  'airlineIcao',
-  'airlineIata',
-  'originAirportIcao',
-  'originAirportIata',
-  'originAirportName',
-  'originAirportMunicipality',
-  'destinationAirportIcao',
-  'destinationAirportIata',
-  'destinationAirportName',
-  'destinationAirportMunicipality',
-];
-
-const ddb = new DynamoDBClient({});
-const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE!;
-const SEEN_AIRCRAFT_TABLE = process.env.SEEN_AIRCRAFT_TABLE!;
-const SEEN_TTL_SECONDS = 5 * 60;
-
-export const handler = async () => {
-  const subscriptions = await getAllSubscriptions();
-  await Promise.all(subscriptions.map(pollSubscription));
-};
-
-async function getAllSubscriptions(): Promise<Subscription[]> {
-  const subscriptions: Subscription[] = [];
-  let lastEvaluatedKey: Record<string, unknown> | undefined;
-
-  do {
-    const result = await ddb.send(
-      new ScanCommand({
-        TableName: SUBSCRIPTIONS_TABLE,
-        ExclusiveStartKey: lastEvaluatedKey as never,
-      }),
-    );
-    for (const item of result.Items ?? []) {
-      subscriptions.push(unmarshall(item) as Subscription);
-    }
-    lastEvaluatedKey = result.LastEvaluatedKey;
-  } while (lastEvaluatedKey);
-
-  return subscriptions;
+interface Flight {
+  routeInfo?: RouteInfo;
+  aircraftRecord: AircraftRecord;
+  flightRadarUrl?: string;
 }
 
-async function pollSubscription(subscription: Subscription): Promise<void> {
-  const { subscriptionId, lat, lon, radiusNm } = subscription;
+const ROUTE_INFO_FIELDS: (keyof RouteInfo)[] = [
+  "airlineName",
+  "airlineIcao",
+  "airlineIata",
+  "originAirportIcao",
+  "originAirportIata",
+  "originAirportName",
+  "originAirportMunicipality",
+  "destinationAirportIcao",
+  "destinationAirportIata",
+  "destinationAirportName",
+  "destinationAirportMunicipality",
+];
 
+const MILES_PER_NM = 1.150779448;
+
+interface HttpRequest {
+  headers?: Record<string, string | undefined>;
+  queryStringParameters?: Record<string, string | undefined>;
+}
+
+interface HttpResponse {
+  statusCode: number;
+  headers?: Record<string, string>;
+  body: string;
+}
+
+function jsonResponse(statusCode: number, body: unknown): HttpResponse {
+  return {
+    statusCode,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
+const ssmClient = new SSMClient({});
+let cachedApiKey: Promise<string> | undefined;
+
+// Fetched once per Lambda execution environment and reused across
+// invocations in that container, rather than hitting SSM on every request.
+function getExpectedApiKey(): Promise<string> {
+  if (!cachedApiKey) {
+    const parameterName = process.env.API_KEY_PARAMETER_NAME;
+    if (!parameterName) {
+      return Promise.reject(
+        new Error("API_KEY_PARAMETER_NAME environment variable is not set"),
+      );
+    }
+    cachedApiKey = ssmClient
+      .send(new GetParameterCommand({ Name: parameterName, WithDecryption: true }))
+      .then((result) => {
+        const value = result.Parameter?.Value;
+        if (!value) throw new Error(`SSM parameter ${parameterName} has no value`);
+        return value;
+      })
+      .catch((err) => {
+        cachedApiKey = undefined; // don't poison the container on a transient failure
+        throw err;
+      });
+  }
+  return cachedApiKey;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+export async function handler(event: HttpRequest): Promise<HttpResponse> {
+  try {
+    const expectedApiKey = await getExpectedApiKey();
+    const providedApiKey = event.headers?.["x-api-key"];
+    if (!providedApiKey || !safeEqual(providedApiKey, expectedApiKey)) {
+      return jsonResponse(401, { error: "Missing or invalid x-api-key header" });
+    }
+  } catch (err) {
+    console.error(`API key check failed: ${(err as Error).message}`);
+    return jsonResponse(500, { error: "Internal error" });
+  }
+
+  const params = event.queryStringParameters ?? {};
+
+  const lat = Number(params.lat);
+  const lon = Number(params.lon);
+  if (params.lat === undefined || params.lon === undefined || Number.isNaN(lat) || Number.isNaN(lon)) {
+    return jsonResponse(400, { error: "lat and lon query parameters are required and must be numbers" });
+  }
+
+  let radiusNm: number;
+  if (params.radiusNm !== undefined) {
+    radiusNm = Number(params.radiusNm);
+  } else if (params.radiusMiles !== undefined) {
+    radiusNm = Number(params.radiusMiles) / MILES_PER_NM;
+  } else {
+    return jsonResponse(400, { error: "radiusNm or radiusMiles query parameter is required" });
+  }
+  if (Number.isNaN(radiusNm)) {
+    return jsonResponse(400, { error: "radius must be a number" });
+  }
+
+  try {
+    const flights = await getFlights(lat, lon, radiusNm);
+    return jsonResponse(200, flights);
+  } catch (err) {
+    console.error(`getFlights failed for ${lat},${lon}: ${(err as Error).message}`);
+    return jsonResponse(500, { error: "Internal error" });
+  }
+}
+
+async function getFlights(
+  lat: number,
+  lon: number,
+  radiusNm: number,
+): Promise<Flight[]> {
+  console.log(`Getting aircraft within ${radiusNm}nm of ${lat},${lon}`);
   const url = `https://api.airplanes.live/v2/point/${lat}/${lon}/${radiusNm}`;
   const response = await fetch(url);
   if (!response.ok) {
-    console.error(`airplanes.live request failed for ${subscriptionId}: ${response.status} ${response.statusText}`);
-    return;
+    console.error(
+      `airplanes.live request failed for ${lat},${lon}: ${response.status} ${response.statusText}`,
+    );
+    return [];
   }
 
   const data = (await response.json()) as { ac?: RawAircraft[] };
   const aircraft = data.ac ?? [];
-  const expiresAt = Math.floor(Date.now() / 1000) + SEEN_TTL_SECONDS;
 
+  let flights: Flight[] = [];
   for (const ac of aircraft) {
     if (!ac.hex) continue;
-    if (ac.alt_baro === 'ground') continue; // parked/taxiing, not flying overhead
-
-    const seen = await ddb.send(
-      new GetItemCommand({
-        TableName: SEEN_AIRCRAFT_TABLE,
-        Key: {
-          subscriptionId: { S: subscriptionId },
-          icaoHex: { S: ac.hex },
-        },
-      }),
-    );
+    if (ac.alt_baro === "ground") continue; // parked/taxiing, not flying overhead
 
     const record = toAircraftRecord(ac);
 
     // Route/airline data doesn't change mid-flight, so only look it up on
     // first sighting and carry it forward on subsequent polls.
-    const route = seen.Item ? extractRouteInfo(unmarshall(seen.Item)) : await lookupRoute(ac.flight);
+    const route = await lookupRoute(ac.flight);
 
-    if (!seen.Item) {
-      console.log(
-        JSON.stringify({
-          event: 'new_aircraft',
-          subscriptionId,
-          icaoHex: ac.hex,
-          ...record,
-          ...route,
-        }),
-      );
-    }
-
-    await ddb.send(
-      new PutItemCommand({
-        TableName: SEEN_AIRCRAFT_TABLE,
-        Item: marshall(
-          {
-            subscriptionId,
-            icaoHex: ac.hex,
-            expiresAt,
-            ...record,
-            ...route,
-          },
-          { removeUndefinedValues: true },
-        ),
+    console.log(
+      JSON.stringify({
+        event: "new_aircraft",
+        icaoHex: ac.hex,
+        ...record,
+        ...route,
       }),
     );
+    flights.push({
+      aircraftRecord: record,
+      routeInfo: route ? route : undefined,
+      flightRadarUrl: record.callSign
+        ? `https://www.flightradar24.com/${encodeURIComponent(record.callSign)}`
+        : undefined,
+    });
   }
+  console.log(`Got ${flights.length} flights`);
+  return flights;
 }
 
-async function lookupRoute(flight: string | undefined): Promise<RouteInfo | undefined> {
+async function lookupRoute(
+  flight: string | undefined,
+): Promise<RouteInfo | undefined> {
   const callsign = flight?.trim();
   if (!callsign) return undefined;
 
   try {
-    const response = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`);
+    const response = await fetch(
+      `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`,
+    );
     if (!response.ok) return undefined;
 
     const data = (await response.json()) as {
       response?: {
         flightroute?: {
           airline?: { name?: string; icao?: string; iata?: string };
-          origin?: { icao_code?: string; iata_code?: string; name?: string; municipality?: string };
-          destination?: { icao_code?: string; iata_code?: string; name?: string; municipality?: string };
+          origin?: {
+            icao_code?: string;
+            iata_code?: string;
+            name?: string;
+            municipality?: string;
+          };
+          destination?: {
+            icao_code?: string;
+            iata_code?: string;
+            name?: string;
+            municipality?: string;
+          };
         };
       };
     };
@@ -256,24 +320,11 @@ async function lookupRoute(flight: string | undefined): Promise<RouteInfo | unde
       destinationAirportMunicipality: route.destination?.municipality,
     };
   } catch (err) {
-    console.error(`Route lookup failed for ${callsign}: ${(err as Error).message}`);
+    console.error(
+      `Route lookup failed for ${callsign}: ${(err as Error).message}`,
+    );
     return undefined;
   }
-}
-
-function extractRouteInfo(item: Record<string, unknown>): RouteInfo | undefined {
-  const route: RouteInfo = {};
-  let hasAny = false;
-
-  for (const field of ROUTE_INFO_FIELDS) {
-    const value = item[field];
-    if (typeof value === 'string') {
-      route[field] = value;
-      hasAny = true;
-    }
-  }
-
-  return hasAny ? route : undefined;
 }
 
 function toAircraftRecord(ac: RawAircraft): AircraftRecord {

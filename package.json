@@ -4,12 +4,11 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
-    "test": "jest",
+    "test": "jest --passWithNoTests",
     "cdk": "cdk"
   },
   "devDependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1091.0",
-    "@aws-sdk/util-dynamodb": "^3.996.7",
+    "@aws-sdk/client-ssm": "^3.1093.0",
     "@swc/core": "^1.15.0",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30",

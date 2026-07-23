@@ -1,25 +1,19 @@
 # tailtrack
 
-Tracks aircraft flying over locations you care about. Subscribe a lat/lon/radius, and a
-scheduled poller checks [airplanes.live](https://airplanes.live) every minute for aircraft
-in range, logging any that weren't seen recently.
+Looks up aircraft flying over a location right now. Give it a lat, lon, and radius (nm), and
+it queries [airplanes.live](https://airplanes.live) for aircraft in range, filters out
+anything still on the ground, and enriches each result with airline/route info looked up from
+[adsbdb.com](https://api.adsbdb.com) by callsign.
 
 ## How it works
 
-- **`SubscriptionsTable`** (DynamoDB) — `subscriptionId` → `lat`, `lon`, `radiusNm`. No CRUD
-  API yet; add subscriptions directly (console/CLI).
-- **`PollSubscriptionsFunction`** (Lambda) — runs every minute via EventBridge. Scans all
-  subscriptions, queries airplanes.live for each, skips aircraft still on the ground, and
-  diffs against `SeenAircraftTable` to find genuinely new arrivals. Logs a `new_aircraft`
-  event (JSON, to CloudWatch Logs) for each one, enriched with airline/route data looked up
-  from [adsbdb.com](https://api.adsbdb.com) by callsign.
-- **`SeenAircraftTable`** (DynamoDB) — `subscriptionId` + `icaoHex` → full aircraft record
-  (position, altitude, speed, squawk, registration, type, route, etc). TTL-evicted 5 minutes
-  after last sighting, so a plane that leaves and comes back later counts as new again.
-- **`GetAircraftFunction`** (Lambda) — on-demand lookup, direct-invoke only (no HTTP
-  endpoint yet). Accepts either `{ "subscriptionId": "..." }` or
-  `{ "lat": ..., "lon": ..., "radiusNm": ... }` (radius defaults to 50nm) and returns the
-  current aircraft in range.
+- **`GetFlights`** (Lambda) — the only resource in the stack. Exposed via a Lambda Function
+  URL, gated by a required `x-api-key` header (see [API key](#api-key) below). Accepts `lat`,
+  `lon`, and either `radiusNm` or `radiusMiles` as query string params, and returns the
+  current aircraft in range, each with its raw position/altitude/speed fields (renamed to
+  human-readable names), any route info found for its callsign, and a `flightRadarUrl`
+  linking to that flight on FlightRadar24 (omitted for aircraft with no callsign — mostly
+  private/GA flights).
 
 Known limitation: route/airline data comes from a callsign→schedule lookup, not a live flight
 plan, so it can be wrong for delayed flights or reused flight numbers.
@@ -39,24 +33,41 @@ plan, so it can be wrong for delayed flights or reused flight numbers.
 * `npx cdk diff`      compare deployed stack with current state
 * `npx cdk deploy`    deploy this stack to your configured AWS account/region
 
-## Adding a subscription
+## API key
 
-No API yet — insert directly into DynamoDB:
+The Function URL has no AWS-native auth (Function URLs don't support API Gateway-style API
+keys) — instead, the handler checks an `x-api-key` header against a value stored in SSM
+Parameter Store as a `SecureString`. There's no CRUD API for it, same as other one-off config
+in this project — create it directly:
 
 ```bash
-aws dynamodb put-item \
-  --table-name <SubscriptionsTable name, from stack outputs> \
-  --item '{
-    "subscriptionId": {"S": "jfk-area"},
-    "lat": {"N": "40.6413"},
-    "lon": {"N": "-73.7781"},
-    "radiusNm": {"N": "50"}
-  }'
+aws ssm put-parameter \
+  --name "/tailtrack/api-key" \
+  --type SecureString \
+  --value "$(openssl rand -hex 32)"
 ```
 
-Stack output names (table names, function names) are printed after `cdk deploy`, or fetch them
-any time with:
+Save the generated value somewhere — SSM won't show it back to you except via `get-parameter
+--with-decryption`. To rotate it, `put-parameter ... --overwrite` with a new value; the
+Lambda caches the key per execution environment, so it can take up to the container's
+lifetime to pick up a rotated value (cold starts always fetch fresh).
+
+## Invoking it
+
+Plain `GET` request to the function URL with the API key in a header. `lat` and `lon` are
+required; radius accepts either `radiusNm` or `radiusMiles` (exactly one is required):
+
+```bash
+curl -H "x-api-key: <your key>" \
+  "<GetFlights function URL, from stack outputs>?lat=40.6413&lon=-73.7781&radiusNm=50"
+```
+
+Stack output names (function URL, function name) are printed after `cdk deploy`, or fetch
+them any time with:
 
 ```bash
 aws cloudformation describe-stacks --stack-name TailtrackStack --query "Stacks[0].Outputs"
 ```
+
+curl -H "x-api-key: <your key>" \
+  "https://we6763sajfixltezw7cwjw74ge0bylmy.lambda-url.us-east-2.on.aws/?lat=40.6413&lon=-73.7781&radiusNm=50"
